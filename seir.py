@@ -10,6 +10,7 @@ from sklearn.metrics import mean_absolute_error
 import lmfit
 from tqdm.auto import tqdm
 
+import copy
 import pickle
 import joblib
 import matplotlib.dates as mdates
@@ -37,25 +38,34 @@ def sigmoid(x, xmin, xmax, a, b, c, r):
 
 
 def stepwise_soft(t, coefficients, r=20, c=0.5):
+
     t_arr = np.array(list(coefficients.keys()))
 
-    min_index = np.min(t_arr)
-    max_index = np.max(t_arr)
+    try:
 
-    if t <= min_index:
-        return coefficients[min_index]
-    elif t >= max_index:
-        return coefficients[max_index]
-    else:
-        index = np.min(t_arr[t_arr >= t])
+        min_index = np.min(t_arr)
+        max_index = np.max(t_arr)
 
-    if len(t_arr[t_arr < index]) == 0:
-        return coefficients[index]
-    prev_index = np.max(t_arr[t_arr < index])
-    # sigmoid smoothing
-    q0, q1 = coefficients[prev_index], coefficients[index]
-    out = sigmoid(t, prev_index, index, q0, q1, c, r)
-    return out
+        if t <= min_index:
+            return coefficients[min_index]
+        elif t >= max_index:
+            return coefficients[max_index]
+        else:
+            index = np.min(t_arr[t_arr >= t])
+
+        if len(t_arr[t_arr < index]) == 0:
+            return coefficients[index]
+        prev_index = np.max(t_arr[t_arr < index])
+
+        # Sigmoid smoothing
+
+        q0, q1 = coefficients[prev_index], coefficients[index]
+        out = sigmoid(t, prev_index, index, q0, q1, c, r)
+        return out
+
+    except ValueError:  
+        # Raised if empty
+        pass
 
 # Prepare training data
 df = pd.read_csv('data.csv', sep=';')
@@ -88,12 +98,17 @@ train_subset = df[
 # Model taken from: https://github.com/btseytlin/covid_peak_sir_modelling/blob/main/habr_code.ipynb
 class SEIR:
 
-    def __init__(self):
-        self.params = self.get_fit_params()
+    def __init__(self, data, stepwise_size=60):
+        self.stepwise_size = stepwise_size
+        self.params = self.get_fit_params(data)
 
-    def get_fit_params(self):
+    def get_fit_params(self, data):
 
         params = lmfit.Parameters()
+
+        params.add("sigmoid_r", value=20, min=1, max=30, brute_step=1, vary=False)
+        params.add("sigmoid_c", value=0.5, min=0, max=1, brute_step=0.1, vary=False)
+
         params.add("population", value=12_000_000, vary=False)
         params.add("epidemic_started_days_ago", value=10, vary=False)
         params.add("r0", value=4, min=3, max=5, vary=True)
@@ -110,6 +125,12 @@ class SEIR:
         params.add("pi", value=0.2, min=0.15, max=0.3, brute_step=0.01, vary=True)
         # Probability to discover a death
         params.add("pd", value=0.35, min=0.15, max=0.9, brute_step=0.05, vary=True)
+
+        params.add(f"t0_q", value=0, min=0, max=0.99, brute_step=0.1, vary=False)
+        piece_size = self.stepwise_size
+
+        for t in range(piece_size, len(data), piece_size):
+            params.add(f"t{t}_q", value=0.5, min=0, max=0.99, brute_step=0.1, vary=True)
 
         return params
 
@@ -128,6 +149,23 @@ class SEIR:
         S0 = S[-1]
         return (S0, E0, I0, Rec0, D0)
 
+    def get_step_rt_beta(self, t, params):
+        r0 = params['r0']
+        gamma = params['gamma']
+        sigmoid_r = params['sigmoid_r']
+        sigmoid_c = params['sigmoid_c']
+
+        q_coefs = {}
+        for key, value in params.items():
+            if key.startswith('t'):
+                coef_t = int(key.split('_')[0][1:])
+                q_coefs[coef_t] = value.value
+
+        quarantine_mult = stepwise_soft(t, q_coefs, r=sigmoid_r, c=sigmoid_c)
+        rt = r0 - quarantine_mult * r0
+        beta = rt * gamma
+        return quarantine_mult, rt, beta
+
     def step(self, initial_conditions, t):
 
         # Function to be solved via odeint
@@ -140,10 +178,11 @@ class SEIR:
         
         rt = self.params['r0'].value
         beta = rt * gamma
-
-        S, E, I, R, D = initial_conditions
+        quarantine_mult, rt, beta = self.get_step_rt_beta(t, copy.deepcopy(self.params))
 
         # Insert neural network here:
+
+        S, E, I, R, D = initial_conditions
 
         new_exposed = beta * I * (S / population)
         new_infected = delta * E
@@ -165,19 +204,8 @@ class SEIR:
         return ret.T
 
 # Instantiate model, train, and simulate
-model = SEIR()
+model = SEIR(train_subset, 60)
 train_initial_conditions = model.get_initial_conditions(train_subset)
 train_t = np.arange(len(train_subset))
 
 (S, E, I, R, D) = model.predict(train_t, train_initial_conditions)
-
-fig = plt.figure(figsize=(10,7))
-plt.plot(train_subset.date, S, label='Susceptible')
-plt.plot(train_subset.date, E, label='Exposed')
-plt.plot(train_subset.date, I, label='Infected')
-plt.plot(train_subset.date, R, label='Recovered')
-plt.plot(train_subset.date, D, label='Dead')
-plt.legend()
-plt.tight_layout()
-fig.autofmt_xdate()
-plt.show()
