@@ -14,8 +14,51 @@ import pickle
 import joblib
 import matplotlib.dates as mdates
 
+# Utility functions
+def stepwise(t, coefficients):
+    t_arr = np.array(list(coefficients.keys()))
+
+    min_index = np.min(t_arr)
+    max_index = np.max(t_arr)
+
+    if t <= min_index:
+        index = min_index
+    elif t >= max_index:
+        index = max_index
+    else:
+        index = np.min(t_arr[t_arr >= t])
+    return coefficients[index]
+
+
+def sigmoid(x, xmin, xmax, a, b, c, r):
+    x_scaled = (x - xmin) / (xmax - xmin)
+    out = (a * np.exp(c * r) + b * np.exp(r * x_scaled)) / (np.exp(c * r) + np.exp(x_scaled * r))
+    return out
+
+
+def stepwise_soft(t, coefficients, r=20, c=0.5):
+    t_arr = np.array(list(coefficients.keys()))
+
+    min_index = np.min(t_arr)
+    max_index = np.max(t_arr)
+
+    if t <= min_index:
+        return coefficients[min_index]
+    elif t >= max_index:
+        return coefficients[max_index]
+    else:
+        index = np.min(t_arr[t_arr >= t])
+
+    if len(t_arr[t_arr < index]) == 0:
+        return coefficients[index]
+    prev_index = np.max(t_arr[t_arr < index])
+    # sigmoid smoothing
+    q0, q1 = coefficients[prev_index], coefficients[index]
+    out = sigmoid(t, prev_index, index, q0, q1, c, r)
+    return out
+
 # Prepare training data
-df = pd.read_csv('data/data.csv', sep=';')
+df = pd.read_csv('data.csv', sep=';')
 
 df.columns = ['date', 'region', 'total_infected', 'total_recovered', 'total_dead', 'deaths_per_day', 'infected_per_day', 'recovered_per_day']
 df = df[df.region == 'Москва'].reset_index()
@@ -62,6 +105,11 @@ class SEIR:
         params.add("gamma", value=1/9, min=1/14, max=1/7, vary=True)
         # I -> D rate
         params.add("rho", expr='gamma', vary=False)
+
+        # Probability to discover a new infected case in a day
+        params.add("pi", value=0.2, min=0.15, max=0.3, brute_step=0.01, vary=True)
+        # Probability to discover a death
+        params.add("pd", value=0.35, min=0.15, max=0.9, brute_step=0.05, vary=True)
 
         return params
 
@@ -116,3 +164,20 @@ class SEIR:
         ret = odeint(self.step, initial_conditions, t_range)
         return ret.T
 
+# Instantiate model, train, and simulate
+model = SEIR()
+train_initial_conditions = model.get_initial_conditions(train_subset)
+train_t = np.arange(len(train_subset))
+
+(S, E, I, R, D) = model.predict(train_t, train_initial_conditions)
+
+fig = plt.figure(figsize=(10,7))
+plt.plot(train_subset.date, S, label='Susceptible')
+plt.plot(train_subset.date, E, label='Exposed')
+plt.plot(train_subset.date, I, label='Infected')
+plt.plot(train_subset.date, R, label='Recovered')
+plt.plot(train_subset.date, D, label='Dead')
+plt.legend()
+plt.tight_layout()
+fig.autofmt_xdate()
+plt.show()
